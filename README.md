@@ -20,7 +20,6 @@ função de ingestão, diagnóstico e alertas) fica no repositório complementar
 | `src/main.cpp` | Firmware: leitura dos sensores, Wi-Fi, servidor web local, envio para o `ingest` do Eixo |
 | `src/webui.h` | Interface web servida pelo próprio coletor (`http://coletor.local`) |
 | `platformio.ini` | Projeto PlatformIO (placa, partições, bibliotecas) |
-| `case/` | Cases paramétricos em CadQuery (unidade de sensores e unidade principal), STEP/STL e imagens. Veja [`case/README.md`](case/README.md) |
 
 ## Hardware
 
