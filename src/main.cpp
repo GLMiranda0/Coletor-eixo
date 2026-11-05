@@ -457,22 +457,9 @@ void formatIso8601(int64_t ms, char *out, size_t len) {
 // Arredonda para o JSON nao sair com 7 casas de ruido
 float round2(float v) { return roundf(v * 100.0f) / 100.0f; }
 
-// Formato da funcao ingest(p_token, p) do Eixo (GLMiranda0/eixo-tcc, prototipos/supabase/schema.sql):
-//   {"p_token": "<token>", "p": {"ts": "...", "temp": 58.1, "corr": 9.4, "vib": 2.6}}
-// temp: maior leitura valida dos DS18B20 (C); corr: media das fases com leitura (A);
-// vib: velocidade RMS do eixo mais alto (mm/s). Grandeza sem leitura fica fora do JSON.
-// Os demais campos de "p" sao ignorados pelo ingest e ficam como detalhe para depuracao.
-void buildPayload(String &body) {
-  JsonDocument doc;
-  doc["p_token"] = cfg.token;
-  JsonObject p = doc["p"].to<JsonObject>();
-
-  if (last.tsMs > 0) {
-    char ts[32];
-    formatIso8601(last.tsMs, ts, sizeof(ts));
-    p["ts"] = ts;  // sem NTP o banco usa a hora de chegada
-  }
-
+// Grandezas no formato do Eixo: temp, corr e vib (as que o ingest le). Sem leitura, a chave fica de fora.
+// Usado no POST e na interface local, para a tela mostrar exatamente o que e enviado.
+void addEixoValues(JsonObject p) {
   bool hasTemp = false;
   float maxTemp = 0;
   for (uint8_t i = 0; i < last.tempCount; i++) {
@@ -493,6 +480,25 @@ void buildPayload(String &body) {
   p["corr"] = round2(phases ? sumAmps / phases : 0);  // 0 = motor parado
 
   if (last.vib.valid) p["vib"] = round2(last.vib.vel);
+}
+
+// Formato da funcao ingest(p_token, p) do Eixo (GLMiranda0/eixo-tcc, prototipos/supabase/schema.sql):
+//   {"p_token": "<token>", "p": {"ts": "...", "temp": 58.1, "corr": 9.4, "vib": 2.6}}
+// temp: maior leitura valida dos DS18B20 (C); corr: media das fases com leitura (A);
+// vib: velocidade RMS do eixo mais alto (mm/s). Grandeza sem leitura fica fora do JSON.
+// Os demais campos de "p" sao ignorados pelo ingest e ficam como detalhe para depuracao.
+void buildPayload(String &body) {
+  JsonDocument doc;
+  doc["p_token"] = cfg.token;
+  JsonObject p = doc["p"].to<JsonObject>();
+
+  if (last.tsMs > 0) {
+    char ts[32];
+    formatIso8601(last.tsMs, ts, sizeof(ts));
+    p["ts"] = ts;  // sem NTP o banco usa a hora de chegada
+  }
+
+  addEixoValues(p);
 
   // Detalhe (fora do schema do Eixo)
   p["device_id"] = apName;
@@ -584,6 +590,7 @@ void handleReadings() {
   }
   JsonDocument doc;
   doc["ts"] = last.tsMs;
+  addEixoValues(doc["eixo"].to<JsonObject>());
   JsonArray temps = doc["temp_c"].to<JsonArray>();
   for (uint8_t i = 0; i < last.tempCount; i++) {
     if (last.temps[i] == DEVICE_DISCONNECTED_C) {
