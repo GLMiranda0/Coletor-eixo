@@ -94,10 +94,19 @@ os outros campos de `p` (`device_id`, `ip`, `corr_fases`, `vib_eixos`) são igno
 ### Velocidade de vibração
 
 O ADXL345 mede aceleração. Para cada eixo, o firmware tira a média (a gravidade), integra a janela
-de amostras (500 amostras a 2 ms = 1 s) e aplica um passa-altas de 1ª ordem em 5 Hz para tirar a deriva.
-Conferido com senoides sintéticas: −3 % a 29,5 Hz, −1 % a 59 Hz, +4 % a 100 Hz, ruído de ~0,2 mm/s com o sensor parado.
-A banda vai até a metade da taxa de amostragem (250 Hz), abaixo dos 1000 Hz da norma, então é um valor
-indicativo para tendência e alerta, não uma medição certificada.
+de amostras (500 amostras a 2 ms = 1 s) com o integrador de Al-Alaoui e aplica um passa-altas
+**Butterworth de 2ª ordem em 10 Hz**, o limite de baixo da banda da ISO 10816. Os primeiros 0,1 s
+ficam fora da conta (transiente do filtro).
+
+Conferido com senoides sintéticas (ganho medido ÷ esperado):
+
+| 10 Hz | 15 Hz | 29,5 Hz | 59 Hz | 100 Hz | 200 Hz | ruído, sensor parado |
+|---|---|---|---|---|---|---|
+| 0,71 (−3 dB, o corte) | 0,91 | 0,99 | 0,99 | 0,99 | 1,03 | ~0,13 mm/s |
+
+O limite de cima é a metade da taxa de amostragem (250 Hz), abaixo dos 1000 Hz da norma: chegar lá
+exige ligar o ADXL345 por SPI. Somado à resolução do sensor (~4 mg), é um valor indicativo para
+tendência e alerta, não uma medição certificada.
 
 Os valores normalizados pela gravidade (EMA, RMS, pico, desvio padrão, repouso ≈ 1,0) continuam na
 interface local e no serial.

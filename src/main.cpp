@@ -59,11 +59,12 @@ constexpr uint8_t I2C_SDA_PIN = 21;
 constexpr uint8_t I2C_SCL_PIN = 22;
 constexpr int VIB_CAL_SAMPLES = 200;
 constexpr int VIB_MAX_BATCH = 2000;
-// Passa-altas da velocidade: tira a deriva da integracao. A ISO 10816 mede de 10 a 1000 Hz, mas
-// um filtro de 1a ordem em 10 Hz ja corta ~10% em 29,5 Hz (1x de motor de 4 polos); em 5 Hz o erro
-// fica em -3% a 30 Hz e +4% a 100 Hz, com ~0,2 mm/s de piso de ruido. O limite de cima e a metade
-// da taxa de amostragem (250 Hz com 2 ms).
-constexpr float VIB_HP_HZ = 5.0f;
+// Velocidade de vibracao: limite de baixo da banda da ISO 10816 (10 Hz), com passa-altas Butterworth
+// de 2a ordem, que tambem tira a deriva da integracao. O limite de cima e a metade da taxa de
+// amostragem (250 Hz com 2 ms), abaixo dos 1000 Hz da norma.
+// Conferido com senoides: -3 dB em 10 Hz, -9% em 15 Hz e +-2% de 29,5 a 200 Hz; ~0,13 mm/s de ruido.
+constexpr double VIB_HP_HZ = 10.0;
+constexpr double VIB_SETTLE_S = 0.1;  // inicio da janela fora da conta (transiente do filtro)
 constexpr float GRAVITY_MS2 = 9.80665f;
 
 // Valores padrao da coleta de vibracao (ajustaveis pela interface web)
@@ -107,7 +108,7 @@ struct Vibration {
   bool valid;
   int16_t x, y, z;  // ultima amostra bruta
   float ema, rms, peak, stdDev;  // normalizados pela gravidade (repouso ~ 1.0)
-  float velAxes[3];  // velocidade RMS por eixo (X, Y, Z), mm/s, banda de VIB_HP_HZ ate Nyquist
+  float velAxes[3];  // velocidade RMS por eixo (X, Y, Z), mm/s, de VIB_HP_HZ ate a metade da taxa de amostragem
   float vel;         // maior dos tres eixos (criterio da ISO 10816) -> "vib" no Eixo
 };
 
@@ -347,30 +348,40 @@ void calibrateGravity() {
 int16_t vibSamples[VIB_MAX_BATCH][3];
 
 // Velocidade de vibracao RMS (mm/s) por eixo, a grandeza da ISO 10816-3 que o Eixo usa:
-// tira a media (gravidade) da aceleracao, integra e passa por um passa-altas de VIB_HP_HZ.
-// O inicio da janela (3 constantes de tempo do filtro) fica fora da conta.
+// tira a media (gravidade) da aceleracao, integra e passa pelo passa-altas de VIB_HP_HZ.
+// Integrador de Al-Alaoui, y[n] = y[n-1] + T/8 (7 x[n] + x[n-1]): a soma simples superestima
+// as frequencias altas (+32% em 200 Hz com 2 ms); este fica em +3%.
+// Passa-altas: Butterworth de 2a ordem pela transformada bilinear, com pre-distorcao do corte.
 void computeVelocity(int n, float dt, Vibration &vib) {
   vib.vel = 0;
   for (float &v : vib.velAxes) v = 0;
   if (n < 10 || dt <= 0) return;
 
-  const float rc = 1.0f / (2.0f * PI * VIB_HP_HZ);
-  const float alpha = rc / (rc + dt);
-  const int skip = min(n / 2, (int)ceilf(3.0f * rc / dt));
-  const float lsbToMs2 = GRAVITY_MS2 / gravMagnitude;
+  const double k = tan(PI * VIB_HP_HZ * dt);
+  const double norm = 1.0 / (1.0 + M_SQRT2 * k + k * k);
+  const double b0 = norm, b1 = -2.0 * norm, b2 = norm;
+  const double a1 = 2.0 * (k * k - 1.0) * norm, a2 = (1.0 - M_SQRT2 * k + k * k) * norm;
+  const int skip = min(n / 2, (int)ceil(VIB_SETTLE_S / dt));
+  const double lsbToMs2 = GRAVITY_MS2 / gravMagnitude;
 
   for (int axis = 0; axis < 3; axis++) {
     double mean = 0;
     for (int i = 0; i < n; i++) mean += vibSamples[i][axis];
     mean /= n;
 
-    float vel = 0, prevVel = 0, hp = 0;
+    double vel = 0, prevAcc = 0;
+    double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
     double sumSq = 0;
     for (int i = 0; i < n; i++) {
-      vel += (vibSamples[i][axis] - mean) * lsbToMs2 * dt;  // m/s
-      hp = alpha * (hp + vel - prevVel);
-      prevVel = vel;
-      if (i >= skip) sumSq += (double)hp * hp;
+      double acc = (vibSamples[i][axis] - mean) * lsbToMs2;  // m/s2
+      vel += dt / 8.0 * (7.0 * acc + prevAcc);               // m/s
+      prevAcc = acc;
+      double hp = b0 * vel + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+      x2 = x1;
+      x1 = vel;
+      y2 = y1;
+      y1 = hp;
+      if (i >= skip) sumSq += hp * hp;
     }
     vib.velAxes[axis] = sqrt(sumSq / (n - skip)) * 1000.0;  // mm/s
     vib.vel = max(vib.vel, vib.velAxes[axis]);
