@@ -15,6 +15,9 @@
 #include <sys/time.h>
 #include "webui.h"
 
+// Vai em cada leitura enviada (extras.fw no Eixo)
+constexpr const char *FW_VERSION = "1.1.0";
+
 // LED azul onboard da placa (marcado "D2")
 constexpr uint8_t LED_PIN = 2;
 
@@ -73,6 +76,11 @@ constexpr int DEF_VIB_DELAY_MS = 2;    // 2 ms = 500 Hz -> janela de 1 s
 constexpr float DEF_VIB_ALPHA = 0.2f;  // K do filtro EMA
 constexpr uint32_t DEF_POST_INTERVAL_S = 10;
 
+// Fila de envio: cada ciclo de leitura vira um item, que so sai da fila quando o Eixo responde 2xx.
+// Cheia (rede fora do ar), descarta a leitura mais antiga e conta a perda.
+constexpr size_t QUEUE_LEN = 90;        // 3 min no ciclo de 2 s
+constexpr size_t POST_BATCH_MAX = 30;   // leituras por POST
+
 // Nome na rede: http://coletor.local (mDNS), http://coletor no Windows (NetBIOS) e hostname no DHCP.
 // Com mais de um coletor na mesma rede, de um nome diferente a cada um.
 const char *const DEF_NAME = "coletor";
@@ -130,6 +138,34 @@ struct PostStatus {
   bool ok;
   uint32_t atMs;  // millis() do ultimo envio
 } postStatus = {0, false, 0};
+
+// Uma leitura pronta para envio, no formato do Eixo
+struct Sample {
+  uint32_t seq;    // sequencia dentro do boot (1, 2, 3...)
+  uint32_t acqMs;  // millis() da aquisicao -> "idade_ms" quando o NTP nao sincronizou
+  int64_t tsMs;    // epoch em ms; 0 sem NTP
+  bool hasTemp;
+  float temp;      // maior leitura valida dos DS18B20
+  float corr;      // media das fases com leitura
+  bool hasVib;
+  float vel;       // velocidade RMS do eixo mais alto
+  float amps[CT_COUNT];
+  float velAxes[3];
+};
+
+Sample sendQueue[QUEUE_LEN];
+size_t queueHead = 0;   // indice da leitura mais antiga
+size_t queueCount = 0;
+uint32_t bootCount = 0;  // incrementado a cada boot (flash); com seq identifica a leitura sem ambiguidade
+uint32_t seqCounter = 0;
+uint32_t lostCount = 0;  // leituras descartadas com a fila cheia, desde o boot
+bool draining = false;   // fila com atraso: envia o proximo lote sem esperar o intervalo
+
+// Clientes persistentes: a conexao TLS fica aberta entre envios (keep-alive) e o handshake,
+// que leva ~1 s no ESP32, so acontece na primeira vez ou depois de uma queda.
+WiFiClient plainClient;
+WiFiClientSecure secureClient;
+HTTPClient http;
 
 volatile bool reqCal = false;
 volatile bool reqPostNow = false;
@@ -468,96 +504,151 @@ void formatIso8601(int64_t ms, char *out, size_t len) {
 // Arredonda para o JSON nao sair com 7 casas de ruido
 float round2(float v) { return roundf(v * 100.0f) / 100.0f; }
 
-// Grandezas no formato do Eixo: temp, corr e vib (as que o ingest le). Sem leitura, a chave fica de fora.
-// Usado no POST e na interface local, para a tela mostrar exatamente o que e enviado.
-void addEixoValues(JsonObject p) {
-  bool hasTemp = false;
-  float maxTemp = 0;
+// Leitura atual (last) no formato do Eixo
+Sample makeSample() {
+  Sample s = {};
+  s.acqMs = millis();
+  s.tsMs = last.tsMs;
+
   for (uint8_t i = 0; i < last.tempCount; i++) {
     if (last.temps[i] == DEVICE_DISCONNECTED_C) continue;
-    if (!hasTemp || last.temps[i] > maxTemp) maxTemp = last.temps[i];
-    hasTemp = true;
+    if (!s.hasTemp || last.temps[i] > s.temp) s.temp = last.temps[i];
+    s.hasTemp = true;
   }
-  if (hasTemp) p["temp"] = round2(maxTemp);
 
   float sumAmps = 0;
   int phases = 0;
   for (size_t i = 0; i < CT_COUNT; i++) {
+    s.amps[i] = last.amps[i];
     if (last.amps[i] > 0) {
       sumAmps += last.amps[i];
       phases++;
     }
   }
-  p["corr"] = round2(phases ? sumAmps / phases : 0);  // 0 = motor parado
+  s.corr = phases ? sumAmps / phases : 0;  // 0 = motor parado
 
-  if (last.vib.valid) p["vib"] = round2(last.vib.vel);
+  s.hasVib = last.vib.valid;
+  s.vel = last.vib.vel;
+  for (int a = 0; a < 3; a++) s.velAxes[a] = last.vib.velAxes[a];
+  return s;
 }
 
-// Formato da funcao ingest(p_token, p) do Eixo (GLMiranda0/eixo-tcc, prototipos/supabase/schema.sql):
-//   {"p_token": "<token>", "p": {"ts": "...", "temp": 58.1, "corr": 9.4, "vib": 2.6}}
+// Grandezas no formato do Eixo: temp, corr e vib (as que o ingest le). Sem leitura, a chave fica de fora.
+// Usado no POST e na interface local, para a tela mostrar exatamente o que e enviado.
+void addEixoValues(JsonObject p, const Sample &s) {
+  if (s.hasTemp) p["temp"] = round2(s.temp);
+  p["corr"] = round2(s.corr);
+  if (s.hasVib) p["vib"] = round2(s.vel);
+}
+
+// Guarda a leitura do ciclo na fila de envio; cheia, descarta a mais antiga e conta a perda
+void enqueueReading() {
+  Sample s = makeSample();
+  s.seq = ++seqCounter;
+  if (queueCount == QUEUE_LEN) {
+    queueHead = (queueHead + 1) % QUEUE_LEN;
+    queueCount--;
+    lostCount++;
+  }
+  sendQueue[(queueHead + queueCount) % QUEUE_LEN] = s;
+  queueCount++;
+}
+
+// Formato da funcao ingest(p_token, p) do Eixo (GLMiranda0/eixo-tcc, migracao 003): "p" e a lista
+// das n leituras mais antigas da fila, em ordem de aquisicao:
+//   {"p_token": "<token>", "p": [{"ts": "...", "temp": 41.2, "corr": 2.1, "vib": 1.3,
+//                                 "device_id": "coletor-a1b2c3", "boot": 7, "seq": 120, ...}, ...]}
 // temp: maior leitura valida dos DS18B20 (C); corr: media das fases com leitura (A);
 // vib: velocidade RMS do eixo mais alto (mm/s). Grandeza sem leitura fica fora do JSON.
-// Os demais campos de "p" sao ignorados pelo ingest e ficam como detalhe para depuracao.
-void buildPayload(String &body) {
+// device_id + boot + seq deixam o reenvio idempotente (o banco ignora a leitura repetida).
+// Sem NTP vai "idade_ms" no lugar de "ts" e o banco calcula a hora da aquisicao.
+// fw, perdidas, corr_fases e vib_eixos ficam em leituras.extras.
+void buildPayload(String &body, size_t n) {
   JsonDocument doc;
   doc["p_token"] = cfg.token;
-  JsonObject p = doc["p"].to<JsonObject>();
+  JsonArray items = doc["p"].to<JsonArray>();
+  uint32_t now = millis();
 
-  if (last.tsMs > 0) {
-    char ts[32];
-    formatIso8601(last.tsMs, ts, sizeof(ts));
-    p["ts"] = ts;  // sem NTP o banco usa a hora de chegada
-  }
-
-  addEixoValues(p);
-
-  // Detalhe (fora do schema do Eixo)
-  p["device_id"] = apName;
-  p["ip"] = WiFi.localIP().toString();
-  JsonObject fases = p["corr_fases"].to<JsonObject>();
-  for (size_t i = 0; i < CT_COUNT; i++) {
-    fases[currentSensors[i].name] = round2(last.amps[i]);
-  }
-  if (last.vib.valid) {
-    JsonArray axes = p["vib_eixos"].to<JsonArray>();
-    for (float v : last.vib.velAxes) axes.add(round2(v));
+  for (size_t k = 0; k < n; k++) {
+    const Sample &s = sendQueue[(queueHead + k) % QUEUE_LEN];
+    JsonObject p = items.add<JsonObject>();
+    if (s.tsMs > 0) {
+      char ts[32];
+      formatIso8601(s.tsMs, ts, sizeof(ts));
+      p["ts"] = ts;
+    } else {
+      p["idade_ms"] = now - s.acqMs;
+    }
+    addEixoValues(p, s);
+    p["device_id"] = apName;
+    p["boot"] = bootCount;
+    p["seq"] = s.seq;
+    p["fw"] = FW_VERSION;
+    p["perdidas"] = lostCount;
+    JsonObject fases = p["corr_fases"].to<JsonObject>();
+    for (size_t i = 0; i < CT_COUNT; i++) {
+      fases[currentSensors[i].name] = round2(s.amps[i]);
+    }
+    if (s.hasVib) {
+      JsonArray axes = p["vib_eixos"].to<JsonArray>();
+      for (float v : s.velAxes) axes.add(round2(v));
+    }
   }
 
   serializeJson(doc, body);
 }
 
-void postReadings() {
-  if (cfg.postUrl.isEmpty() || !last.valid || WiFi.status() != WL_CONNECTED) return;
-
-  String body;
-  buildPayload(body);
-
-  WiFiClient plainClient;
-  WiFiClientSecure secureClient;
-  secureClient.setInsecure();  // sem verificacao de certificado
+// Um POST na conexao persistente. Se a conexao reaproveitada tiver caido (codigo < 0),
+// fecha e tenta mais uma vez com uma conexao nova.
+int sendPost(const String &body) {
   bool https = cfg.postUrl.startsWith("https://");
+  WiFiClient &client = https ? (WiFiClient &)secureClient : plainClient;
+  int code = HTTPC_ERROR_CONNECTION_REFUSED;
 
-  HTTPClient http;
-  http.setTimeout(5000);
-  postStatus.atMs = millis();
-  if (!(https ? http.begin(secureClient, cfg.postUrl) : http.begin(plainClient, cfg.postUrl))) {
-    Serial.println("POST: URL invalida");
-    postStatus = {-1, false, postStatus.atMs};
-    return;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (!http.begin(client, cfg.postUrl)) {
+      Serial.println("POST: URL invalida");
+      return HTTPC_ERROR_CONNECTION_REFUSED;
+    }
+    http.setTimeout(5000);
+    http.addHeader("Content-Type", "application/json");
+    if (!cfg.apiKey.isEmpty()) http.addHeader("apikey", cfg.apiKey);  // PostgREST do Supabase
+
+    code = http.POST(body);
+    if (code > 0) {
+      // le a resposta inteira: sobra no socket atrapalharia o proximo POST na mesma conexao
+      String resp = http.getString();
+      Serial.printf("POST %d -> %s\n", code, cfg.postUrl.c_str());
+      if (code < 200 || code >= 300) Serial.println("Resposta: " + resp);
+      http.end();  // com reuse, mantem a conexao aberta
+      return code;
+    }
+    Serial.printf("POST erro: %s%s\n", http.errorToString(code).c_str(), attempt == 0 ? " (nova conexao)" : "");
+    http.end();
+    client.stop();
   }
-  http.addHeader("Content-Type", "application/json");
-  if (!cfg.apiKey.isEmpty()) http.addHeader("apikey", cfg.apiKey);  // PostgREST do Supabase
+  return code;
+}
 
-  int code = http.POST(body);
+// Envia o lote mais antigo da fila; so remove da fila o que o Eixo confirmou (2xx).
+bool postReadings() {
+  if (cfg.postUrl.isEmpty() || queueCount == 0 || WiFi.status() != WL_CONNECTED) return false;
+
+  size_t n = min(queueCount, POST_BATCH_MAX);
+  String body;
+  buildPayload(body, n);
+
+  postStatus.atMs = millis();
+  int code = sendPost(body);
   postStatus.code = code;
   postStatus.ok = code >= 200 && code < 300;
-  if (code > 0) {
-    Serial.printf("POST %d -> %s\n", code, cfg.postUrl.c_str());
-    if (!postStatus.ok) Serial.println("Resposta: " + http.getString());
-  } else {
-    Serial.printf("POST erro: %s\n", http.errorToString(code).c_str());
+  if (postStatus.ok) {
+    queueHead = (queueHead + n) % QUEUE_LEN;
+    queueCount -= n;
+    Serial.printf("Lote de %u leitura(s) confirmado; fila: %u, perdidas: %lu\n", (unsigned)n, (unsigned)queueCount,
+                  (unsigned long)lostCount);
   }
-  http.end();
+  return postStatus.ok;
 }
 
 // ── Interface web ────────────────────────────────────────────────────────────
@@ -590,6 +681,12 @@ void handleStatus() {
   doc["post_ok"] = postStatus.ok;
   doc["post_code"] = postStatus.code;
   doc["post_age_s"] = postStatus.atMs ? (long)((millis() - postStatus.atMs) / 1000) : -1L;
+  doc["queue"] = queueCount;
+  doc["queue_max"] = QUEUE_LEN;
+  doc["lost"] = lostCount;
+  doc["boot"] = bootCount;
+  doc["seq"] = seqCounter;
+  doc["fw"] = FW_VERSION;
   doc["uptime"] = millis() / 1000;
   sendJson(200, doc);
 }
@@ -601,7 +698,7 @@ void handleReadings() {
   }
   JsonDocument doc;
   doc["ts"] = last.tsMs;
-  addEixoValues(doc["eixo"].to<JsonObject>());
+  addEixoValues(doc["eixo"].to<JsonObject>(), makeSample());
   JsonArray temps = doc["temp_c"].to<JsonArray>();
   for (uint8_t i = 0; i < last.tempCount; i++) {
     if (last.temps[i] == DEVICE_DISCONNECTED_C) {
@@ -631,8 +728,11 @@ void handleGetConfig() {
   JsonDocument doc;
   doc["name"] = cfg.name;
   doc["post_url"] = cfg.postUrl;
-  doc["device_token"] = cfg.token;
-  doc["api_key"] = cfg.apiKey;
+  // O token nao sai do coletor: a interface local nao tem login e qualquer um na rede a acessa.
+  // So os 4 ultimos caracteres, para conferir qual esta gravado.
+  doc["device_token_set"] = !cfg.token.isEmpty();
+  doc["device_token_hint"] = cfg.token.length() > 4 ? cfg.token.substring(cfg.token.length() - 4) : String("");
+  doc["api_key"] = cfg.apiKey;  // chave publicavel, feita para ficar exposta
   doc["post_interval"] = cfg.postIntervalS;
   doc["batch_size"] = cfg.vibBatch;
   doc["sample_delay"] = cfg.vibDelayMs;
@@ -665,8 +765,9 @@ void handlePostConfig() {
     cfg.postUrl = url;
   }
   if (doc["device_token"].is<const char *>()) {
-    cfg.token = doc["device_token"].as<String>();
-    cfg.token.trim();
+    String token = doc["device_token"].as<String>();
+    token.trim();
+    if (!token.isEmpty()) cfg.token = token;  // vazio = manter o atual (a interface nao conhece o token)
   }
   if (doc["api_key"].is<const char *>()) {
     cfg.apiKey = doc["api_key"].as<String>();
@@ -739,7 +840,8 @@ constexpr int TOKEN_MAX_LEN = 100;
 constexpr int APIKEY_MAX_LEN = 300;  // a chave anon antiga (JWT) passa de 200 caracteres
 WiFiManagerParameter paramUrl("post_url", "URL de destino (POST)", "", URL_MAX_LEN,
                               "placeholder='https://PROJETO.supabase.co/rest/v1/rpc/ingest'");
-WiFiManagerParameter paramToken("token", "Token do dispositivo (tela do motor no Eixo)", "", TOKEN_MAX_LEN);
+WiFiManagerParameter paramToken("token", "Token do dispositivo (tela do motor no Eixo; vazio mant&eacute;m o atual)", "",
+                                TOKEN_MAX_LEN);
 WiFiManagerParameter paramApiKey("api_key", "Chave publicavel do Supabase (apikey)", "", APIKEY_MAX_LEN);
 char portalInfo[400];
 
@@ -747,7 +849,7 @@ char portalInfo[400];
 void preparePortal() {
   paramName.setValue(cfg.name.c_str(), NAME_MAX_LEN);
   paramUrl.setValue(cfg.postUrl.c_str(), URL_MAX_LEN);
-  paramToken.setValue(cfg.token.c_str(), TOKEN_MAX_LEN);
+  paramToken.setValue("", TOKEN_MAX_LEN);  // o token nao e mostrado; vazio ao salvar = manter o atual
   paramApiKey.setValue(cfg.apiKey.c_str(), APIKEY_MAX_LEN);
 
   String ipLine = WiFi.isConnected() ? "<br>IP atual na rede: <b>" + WiFi.localIP().toString() + "</b>" : "";
@@ -766,6 +868,7 @@ void applyPortalParams() {
   String apiKey = paramApiKey.getValue();
   token.trim();
   apiKey.trim();
+  if (token.isEmpty()) token = cfg.token;
   if (!normalizeName(name)) name = cfg.name;
   if (!normalizeUrl(url)) {
     Serial.println("URL do portal ignorada: deve comecar com http:// ou https://");
@@ -870,6 +973,15 @@ void setup() {
   Serial.println("ESP32 iniciado - DS18B20 + SCT-013-005 + ADXL345");
 
   loadConfig();
+  prefs.begin("coletor", false);
+  bootCount = prefs.getUInt("boot", 0) + 1;
+  prefs.putUInt("boot", bootCount);
+  prefs.end();
+  Serial.printf("Firmware %s, boot #%lu\n", FW_VERSION, (unsigned long)bootCount);
+
+  secureClient.setInsecure();  // sem verificacao de certificado (ver README, Seguranca)
+  http.setReuse(true);
+
   // Ultimos 3 bytes do MAC (os 3 primeiros sao o fabricante, iguais em toda placa)
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -1015,9 +1127,13 @@ void loop() {
     Serial.println("Vibracao: aguardando ADXL345...");
   }
 
-  if (reqPostNow || postStatus.atMs == 0 || millis() - postStatus.atMs >= cfg.postIntervalS * 1000) {
+  // Toda leitura entra na fila; o envio sai no intervalo configurado, ou logo em seguida
+  // enquanto houver atraso acumulado (lote cheio confirmado e ainda sobra fila).
+  if (!cfg.postUrl.isEmpty()) enqueueReading();
+  bool due = reqPostNow || postStatus.atMs == 0 || millis() - postStatus.atMs >= cfg.postIntervalS * 1000;
+  if ((due || draining) && queueCount > 0) {
     reqPostNow = false;
-    postReadings();
+    draining = postReadings() && queueCount > 0;
   }
 
   uint32_t elapsed = millis() - cycleStart;

@@ -58,8 +58,15 @@ Toque curto no botão BOOT reabre o portal sem apagar o Wi-Fi.
 
 ## Envio para o Eixo
 
-Cada envio chama a função `ingest(p_token, p)` do eixo-tcc
-(`prototipos/supabase/schema.sql`):
+A partir do firmware **1.1.0** o envio é em lote e exige a migração
+`prototipos/supabase/003_ingestao_lotes_persistencia.sql` do eixo-tcc aplicada no banco.
+
+Cada ciclo de leitura (2 s) vira um item numa **fila em RAM de 90 leituras** (3 min). No intervalo de
+envio (padrão 10 s, ajustável de 2 a 3600 s), o coletor manda as até 30 leituras mais antigas num único
+POST para a função `ingest(p_token, p)` e só as tira da fila quando o Eixo responde 2xx. Com a rede fora do
+ar a fila segura as leituras; cheia, descarta a mais antiga e soma em `perdidas`. Depois da queda, os lotes
+saem em sequência até a fila esvaziar. A conexão TLS fica aberta entre envios (keep-alive), então o
+handshake (~1 s) só acontece na primeira vez ou depois de uma queda.
 
 ```
 POST https://<projeto>.supabase.co/rest/v1/rpc/ingest
@@ -68,16 +75,22 @@ Content-Type: application/json
 
 {
   "p_token": "eixo_dev_…",
-  "p": {
-    "ts": "2026-11-05T12:00:00.000Z",
-    "temp": 42.5,
-    "corr": 3.2,
-    "vib": 2.71,
-    "device_id": "coletor-a1b2c3",
-    "ip": "192.168.0.50",
-    "corr_fases": { "CT1": 3.2, "CT2": 3.1, "CT3": 3.3 },
-    "vib_eixos": [2.71, 1.05, 0.88]
-  }
+  "p": [
+    {
+      "ts": "2026-11-05T12:00:00.000Z",
+      "temp": 42.5,
+      "corr": 3.2,
+      "vib": 2.71,
+      "device_id": "coletor-a1b2c3",
+      "boot": 7,
+      "seq": 120,
+      "fw": "1.1.0",
+      "perdidas": 0,
+      "corr_fases": { "CT1": 3.2, "CT2": 3.1, "CT3": 3.3 },
+      "vib_eixos": [2.71, 1.05, 0.88]
+    },
+    { "ts": "2026-11-05T12:00:02.000Z", "...": "..." }
+  ]
 }
 ```
 
@@ -86,10 +99,21 @@ Content-Type: application/json
 | `temp` | maior leitura válida dos DS18B20, °C |
 | `corr` | média das fases com leitura (acima de 0,05 A), A; `0` com o motor parado |
 | `vib` | velocidade de vibração RMS do eixo mais alto, mm/s (critério da ISO 10816-3, a escala que o Eixo usa) |
-| `ts` | hora da leitura; só vai depois que o NTP sincroniza (sem ele o banco usa a hora de chegada) |
+| `ts` | hora da aquisição (NTP). Sem NTP vai `idade_ms` (ms desde a aquisição) e o banco calcula a hora |
+| `device_id`, `boot`, `seq` | identificam a leitura: `boot` sobe a cada reinício (gravado em flash), `seq` conta dentro do boot. O banco ignora reenvio da mesma leitura |
+| `perdidas` | leituras descartadas com a fila cheia desde o boot |
 
-Grandeza sem sensor fica fora do JSON. O `ingest` lê só `ts`, `temp`, `corr`, `vib`, `tens` e `rot`;
-os outros campos de `p` (`device_id`, `ip`, `corr_fases`, `vib_eixos`) são ignorados por ele e servem para depuração.
+Grandeza sem sensor fica fora do JSON. `fw`, `perdidas`, `corr_fases` e `vib_eixos` ficam em
+`leituras.extras` no Eixo; a disponibilidade (recebidas × esperadas pela `seq`) e o atraso aquisição → banco
+saem da view `qualidade_telemetria`.
+
+### Segurança
+
+- O token do dispositivo não aparece na interface local nem no portal (só os 4 últimos caracteres);
+  deixar o campo vazio ao salvar mantém o token gravado.
+- O HTTPS **não verifica o certificado do servidor** (`setInsecure()`): o tráfego vai cifrado, mas um
+  intermediário na rede poderia se passar pelo Supabase. Fixar a CA raiz do domínio é o próximo passo.
+- A interface local (`http://coletor.local`) não tem login: deixe o coletor numa rede de equipamentos.
 
 ### Velocidade de vibração
 
@@ -105,7 +129,9 @@ Conferido com senoides sintéticas (ganho medido ÷ esperado):
 | 0,71 (−3 dB, o corte) | 0,91 | 0,99 | 0,99 | 0,99 | 1,03 | ~0,13 mm/s |
 
 O limite de cima é a metade da taxa de amostragem (250 Hz), abaixo dos 1000 Hz da norma: chegar lá
-exige ligar o ADXL345 por SPI. Somado à resolução do sensor (~4 mg), é um valor indicativo para
+exige ligar o ADXL345 por SPI. O sensor trabalha a 800 Hz (banda interna de 400 Hz) e o firmware lê a
+amostra mais recente a cada 2 ms, então vibração entre 250 e 400 Hz pode aparecer dobrada abaixo de
+250 Hz; ler a FIFO do sensor a 800 Hz elimina esse dobramento (ainda não feito, precisa de teste na placa). Somado à resolução do sensor (~4 mg), é um valor indicativo para
 tendência e alerta, não uma medição certificada.
 
 Os valores normalizados pela gravidade (EMA, RMS, pico, desvio padrão, repouso ≈ 1,0) continuam na

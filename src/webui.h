@@ -218,7 +218,7 @@ hr{border:0;border-top:1px solid var(--border);margin:14px 0}
       <div class="field">
         <label for="device_token">Token do dispositivo</label>
         <input type="text" id="device_token" class="mono" autocomplete="off" placeholder="eixo_dev_...">
-        <span class="hint">Gerado na tela do motor. Vai como <code>p_token</code>.</span>
+        <span class="hint">Gerado na tela do motor. Vai como <code>p_token</code>. Por seguran&ccedil;a, o coletor n&atilde;o mostra o token gravado.</span>
       </div>
       <div class="field">
         <label for="api_key">Chave public&aacute;vel do Supabase</label>
@@ -235,6 +235,7 @@ hr{border:0;border-top:1px solid var(--border);margin:14px 0}
       </div>
       <hr>
       <div class="info"><span class="muted">&Uacute;ltimo envio</span><span class="v" id="post-info">&mdash;</span></div>
+      <div class="info"><span class="muted">Fila de envio</span><span class="v" id="queue-info">&mdash;</span></div>
     </section>
 
     <section class="card">
@@ -422,15 +423,21 @@ async function loadStatus() {
       const code = s.post_code > 0 ? 'HTTP ' + s.post_code : 'falha de conexão';
       $('post-info').textContent = code + ' · há ' + s.post_age_s + ' s';
     }
+    $('queue-info').textContent = s.queue + ' de ' + s.queue_max + ' leituras · ' + s.lost + ' perdidas · boot ' + s.boot +
+      ' · seq ' + s.seq + ' · fw ' + s.fw;
   } catch(e) {}
 }
 
 async function loadConfig() {
   try {
     const c = await api('/api/config');
-    ['name', 'post_url', 'device_token', 'api_key', 'post_interval', 'batch_size', 'sample_delay'].forEach(k => {
+    ['name', 'post_url', 'api_key', 'post_interval', 'batch_size', 'sample_delay'].forEach(k => {
       if (c[k] !== undefined) $(k).value = c[k];
     });
+    $('device_token').value = '';
+    $('device_token').placeholder = c.device_token_set
+      ? 'gravado (…' + c.device_token_hint + '); deixe vazio para manter'
+      : 'eixo_dev_...';
     syncAlpha(c.alpha ?? 0.2);
   } catch(e) {}
 }
