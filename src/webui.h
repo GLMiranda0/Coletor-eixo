@@ -37,7 +37,9 @@ main{max-width:860px;margin:0 auto;padding:24px 16px;display:grid;grid-template-
 .card-head h2{font-size:14px;font-weight:700;letter-spacing:.01em}
 .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
 .metrics.m3{grid-template-columns:repeat(3,1fr)}
-@media(max-width:480px){.metrics,.metrics.m3{grid-template-columns:repeat(2,1fr)}}
+.metrics.m5{grid-template-columns:repeat(5,1fr)}
+@media(max-width:620px){.metrics.m5{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:480px){.metrics,.metrics.m3,.metrics.m5{grid-template-columns:repeat(2,1fr)}}
 .metric{background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:14px 10px;text-align:center}
 .metric .lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:7px}
 .metric .val{font-size:22px;font-weight:800;color:var(--navy);font-variant-numeric:tabular-nums;line-height:1}
@@ -108,14 +110,15 @@ hr.div{border:none;border-top:1px solid var(--border);margin:16px 0}
       <div class="card-icon"><svg viewBox="0 0 24 24"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></svg></div>
       <h2>Vibra&ccedil;&atilde;o (ADXL345)</h2>
     </div>
-    <div class="metrics">
+    <div class="metrics m5">
+      <div class="metric" id="box-vel" title="Maior eixo; X / Y / Z no rodap&eacute;"><div class="lbl">Velocidade RMS</div><div class="val" id="v-vel">&mdash;</div><div class="unit">mm/s &middot; enviada ao Eixo</div></div>
       <div class="metric" id="box-ema"><div class="lbl">EMA</div><div class="val" id="v-ema">&mdash;</div><div class="unit">adimensional</div></div>
       <div class="metric" id="box-rms"><div class="lbl">RMS</div><div class="val" id="v-rms">&mdash;</div><div class="unit">adimensional</div></div>
       <div class="metric" id="box-peak"><div class="lbl">Pico</div><div class="val" id="v-peak">&mdash;</div><div class="unit">adimensional</div></div>
       <div class="metric" id="box-std"><div class="lbl">Desvio Padr&atilde;o</div><div class="val" id="v-std">&mdash;</div><div class="unit">adimensional</div></div>
     </div>
     <div class="readings-footer">
-      <span class="ts" id="vib-status">Repouso &asymp; 1.0</span>
+      <span class="ts"><span id="vib-status">Repouso &asymp; 1.0</span><br><span id="vel-axes"></span></span>
       <button class="btn btn-primary" id="btn-cal" onclick="calibrate()">&#9878; Calibrar</button>
     </div>
   </div>
@@ -144,12 +147,18 @@ hr.div{border:none;border-top:1px solid var(--border);margin:16px 0}
     </div>
     <div class="fg">
       <label>URL de destino (POST)</label>
-      <input type="url" id="post_url" placeholder="https://servidor/api/ingest">
-      <div class="hint">Recebe um JSON por envio. Vazio desliga o envio.</div>
+      <input type="url" id="post_url" placeholder="https://PROJETO.supabase.co/rest/v1/rpc/ingest">
+      <div class="hint">Endpoint de ingest&atilde;o do Eixo (copie da tela do motor). Vazio desliga o envio.</div>
     </div>
     <div class="fg">
-      <label>Token do dispositivo (opcional)</label>
-      <input type="text" id="device_token" autocomplete="off">
+      <label>Token do dispositivo</label>
+      <input type="text" id="device_token" autocomplete="off" placeholder="eixo_dev_...">
+      <div class="hint">Gerado na tela do motor, no Eixo. Vai como <code>p_token</code>.</div>
+    </div>
+    <div class="fg">
+      <label>Chave public&aacute;vel do Supabase</label>
+      <input type="text" id="api_key" autocomplete="off" placeholder="sb_publishable_...">
+      <div class="hint">Enviada no header <code>apikey</code>. A mesma <code>VITE_SUPABASE_KEY</code> do app.</div>
     </div>
     <div class="fg">
       <label>Intervalo de envio (s)</label>
@@ -256,6 +265,8 @@ async function loadReadings() {
   try {
     const d = await api('/api/readings');
     if (d.vib) {
+      $('v-vel').textContent = d.vib.vel.toFixed(2);
+      $('vel-axes').textContent = ['X', 'Y', 'Z'].map((k, i) => k + ' ' + d.vib.vel_axes[i].toFixed(2)).join(' · ') + ' mm/s';
       setVib('v-ema', 'box-ema', d.vib.ema);
       setVib('v-rms', 'box-rms', d.vib.rms);
       setVib('v-peak', 'box-peak', d.vib.peak);
@@ -308,7 +319,7 @@ async function loadStatus() {
 async function loadConfig() {
   try {
     const c = await api('/api/config');
-    ['name','post_url','device_token','post_interval','batch_size','sample_delay'].forEach(k => {
+    ['name','post_url','device_token','api_key','post_interval','batch_size','sample_delay'].forEach(k => {
       if (c[k] !== undefined) $(k).value = c[k];
     });
     syncAlpha(c.alpha ?? 0.2);
@@ -320,6 +331,7 @@ async function saveDest() {
     await post('/api/config', {
       post_url:      $('post_url').value.trim(),
       device_token:  $('device_token').value.trim(),
+      api_key:       $('api_key').value.trim(),
       post_interval: Number($('post_interval').value),
     });
     toast('Destino salvo!');

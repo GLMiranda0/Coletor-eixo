@@ -58,6 +58,13 @@ constexpr uint8_t ADXL_DEVID = 0xE5;
 constexpr uint8_t I2C_SDA_PIN = 21;
 constexpr uint8_t I2C_SCL_PIN = 22;
 constexpr int VIB_CAL_SAMPLES = 200;
+constexpr int VIB_MAX_BATCH = 2000;
+// Passa-altas da velocidade: tira a deriva da integracao. A ISO 10816 mede de 10 a 1000 Hz, mas
+// um filtro de 1a ordem em 10 Hz ja corta ~10% em 29,5 Hz (1x de motor de 4 polos); em 5 Hz o erro
+// fica em -3% a 30 Hz e +4% a 100 Hz, com ~0,2 mm/s de piso de ruido. O limite de cima e a metade
+// da taxa de amostragem (250 Hz com 2 ms).
+constexpr float VIB_HP_HZ = 5.0f;
+constexpr float GRAVITY_MS2 = 9.80665f;
 
 // Valores padrao da coleta de vibracao (ajustaveis pela interface web)
 constexpr int DEF_VIB_BATCH = 500;     // amostras por janela
@@ -87,7 +94,8 @@ char apName[24];
 struct Config {
   String name;     // nome na rede (ver DEF_NAME)
   String postUrl;  // vazio = envio desligado
-  String token;
+  String token;    // token do dispositivo, gerado na tela do motor no Eixo -> p_token
+  String apiKey;   // chave publicavel do Supabase -> header "apikey"
   uint32_t postIntervalS;
   int vibBatch;
   int vibDelayMs;
@@ -99,6 +107,8 @@ struct Vibration {
   bool valid;
   int16_t x, y, z;  // ultima amostra bruta
   float ema, rms, peak, stdDev;  // normalizados pela gravidade (repouso ~ 1.0)
+  float velAxes[3];  // velocidade RMS por eixo (X, Y, Z), mm/s, banda de VIB_HP_HZ ate Nyquist
+  float vel;         // maior dos tres eixos (criterio da ISO 10816) -> "vib" no Eixo
 };
 
 struct Readings {
@@ -133,6 +143,7 @@ void loadConfig() {
   cfg.name = prefs.getString("name", DEF_NAME);
   cfg.postUrl = prefs.getString("post_url", "");
   cfg.token = prefs.getString("token", "");
+  cfg.apiKey = prefs.getString("api_key", "");
   cfg.postIntervalS = prefs.getUInt("post_int", DEF_POST_INTERVAL_S);
   cfg.vibBatch = prefs.getInt("vib_batch", DEF_VIB_BATCH);
   cfg.vibDelayMs = prefs.getInt("vib_delay", DEF_VIB_DELAY_MS);
@@ -146,6 +157,7 @@ void saveConfig() {
   prefs.putString("name", cfg.name);
   prefs.putString("post_url", cfg.postUrl);
   prefs.putString("token", cfg.token);
+  prefs.putString("api_key", cfg.apiKey);
   prefs.putUInt("post_int", cfg.postIntervalS);
   prefs.putInt("vib_batch", cfg.vibBatch);
   prefs.putInt("vib_delay", cfg.vibDelayMs);
@@ -331,6 +343,40 @@ void calibrateGravity() {
   Serial.printf("Magnitude de repouso: %.1f LSB\n", gravMagnitude);
 }
 
+// Amostras brutas da ultima janela, usadas para integrar a velocidade
+int16_t vibSamples[VIB_MAX_BATCH][3];
+
+// Velocidade de vibracao RMS (mm/s) por eixo, a grandeza da ISO 10816-3 que o Eixo usa:
+// tira a media (gravidade) da aceleracao, integra e passa por um passa-altas de VIB_HP_HZ.
+// O inicio da janela (3 constantes de tempo do filtro) fica fora da conta.
+void computeVelocity(int n, float dt, Vibration &vib) {
+  vib.vel = 0;
+  for (float &v : vib.velAxes) v = 0;
+  if (n < 10 || dt <= 0) return;
+
+  const float rc = 1.0f / (2.0f * PI * VIB_HP_HZ);
+  const float alpha = rc / (rc + dt);
+  const int skip = min(n / 2, (int)ceilf(3.0f * rc / dt));
+  const float lsbToMs2 = GRAVITY_MS2 / gravMagnitude;
+
+  for (int axis = 0; axis < 3; axis++) {
+    double mean = 0;
+    for (int i = 0; i < n; i++) mean += vibSamples[i][axis];
+    mean /= n;
+
+    float vel = 0, prevVel = 0, hp = 0;
+    double sumSq = 0;
+    for (int i = 0; i < n; i++) {
+      vel += (vibSamples[i][axis] - mean) * lsbToMs2 * dt;  // m/s
+      hp = alpha * (hp + vel - prevVel);
+      prevVel = vel;
+      if (i >= skip) sumSq += (double)hp * hp;
+    }
+    vib.velAxes[axis] = sqrt(sumSq / (n - skip)) * 1000.0;  // mm/s
+    vib.vel = max(vib.vel, vib.velAxes[axis]);
+  }
+}
+
 // Coleta uma janela de amostras e extrai EMA, RMS, pico e desvio padrao da magnitude normalizada.
 // Atende a interface web entre as amostras.
 void measureVibration(Vibration &vib) {
@@ -342,10 +388,11 @@ void measureVibration(Vibration &vib) {
   if (gravMagnitude <= 0) calibrateGravity();
   if (gravMagnitude <= 0) return;
 
-  int batch = constrain(cfg.vibBatch, 10, 2000);
+  int batch = constrain(cfg.vibBatch, 10, VIB_MAX_BATCH);
   double sum = 0, sumSq = 0;
   float peak = 0;
   int n = 0;
+  uint32_t firstUs = 0, lastUs = 0;
 
   uint32_t next = millis();
   for (int i = 0; i < batch; i++) {
@@ -356,6 +403,11 @@ void measureVibration(Vibration &vib) {
 
     int16_t ax, ay, az;
     if (!readAccel(ax, ay, az)) continue;
+    lastUs = micros();
+    if (n == 0) firstUs = lastUs;
+    vibSamples[n][0] = ax;
+    vibSamples[n][1] = ay;
+    vibSamples[n][2] = az;
     float v = magnitude(ax, ay, az) / gravMagnitude;
     vibEma = vibEma == 0 ? v : cfg.vibAlpha * v + (1.0f - cfg.vibAlpha) * vibEma;
     sum += v;
@@ -378,6 +430,10 @@ void measureVibration(Vibration &vib) {
   vib.rms = sqrt(sumSq / n);
   vib.peak = peak;
   vib.stdDev = variance > 0 ? sqrt(variance) : 0;
+
+  // Intervalo real entre amostras (o atendimento da interface web atrasa algumas)
+  float dt = (lastUs - firstUs) / 1e6f / (n - 1);
+  computeVelocity(n, dt, vib);
   vib.valid = true;
 }
 
@@ -398,42 +454,56 @@ void formatIso8601(int64_t ms, char *out, size_t len) {
   snprintf(out + n, len - n, ".%03dZ", (int)(ms % 1000));
 }
 
+// Arredonda para o JSON nao sair com 7 casas de ruido
+float round2(float v) { return roundf(v * 100.0f) / 100.0f; }
+
+// Formato da funcao ingest(p_token, p) do Eixo (GLMiranda0/eixo-tcc, prototipos/supabase/schema.sql):
+//   {"p_token": "<token>", "p": {"ts": "...", "temp": 58.1, "corr": 9.4, "vib": 2.6}}
+// temp: maior leitura valida dos DS18B20 (C); corr: media das fases com leitura (A);
+// vib: velocidade RMS do eixo mais alto (mm/s). Grandeza sem leitura fica fora do JSON.
+// Os demais campos de "p" sao ignorados pelo ingest e ficam como detalhe para depuracao.
 void buildPayload(String &body) {
   JsonDocument doc;
-  doc["device_id"] = apName;
-  doc["name"] = cfg.name;
-  doc["ip"] = WiFi.localIP().toString();  // para o servidor saber onde acessar o coletor
-  if (!cfg.token.isEmpty()) doc["device_token"] = cfg.token;
+  doc["p_token"] = cfg.token;
+  JsonObject p = doc["p"].to<JsonObject>();
+
   if (last.tsMs > 0) {
-    char recordedAt[32];
-    formatIso8601(last.tsMs, recordedAt, sizeof(recordedAt));
-    doc["recorded_at"] = recordedAt;
+    char ts[32];
+    formatIso8601(last.tsMs, ts, sizeof(ts));
+    p["ts"] = ts;  // sem NTP o banco usa a hora de chegada
   }
 
-  JsonObject payload = doc["payload"].to<JsonObject>();
-  // Mesmos campos do prototipo de vibracao, para manter compatibilidade com a API de ingestao
-  if (last.vib.valid) {
-    payload["x"] = last.vib.x;
-    payload["y"] = last.vib.y;
-    payload["z"] = last.vib.z;
-    payload["rms"] = last.vib.rms;
-    payload["ema"] = last.vib.ema;
-    payload["peak"] = last.vib.peak;
-    payload["std"] = last.vib.stdDev;
-  }
-
-  JsonArray temps = payload["temp_c"].to<JsonArray>();
+  bool hasTemp = false;
+  float maxTemp = 0;
   for (uint8_t i = 0; i < last.tempCount; i++) {
-    if (last.temps[i] == DEVICE_DISCONNECTED_C) {
-      temps.add(nullptr);
-    } else {
-      temps.add(last.temps[i]);
+    if (last.temps[i] == DEVICE_DISCONNECTED_C) continue;
+    if (!hasTemp || last.temps[i] > maxTemp) maxTemp = last.temps[i];
+    hasTemp = true;
+  }
+  if (hasTemp) p["temp"] = round2(maxTemp);
+
+  float sumAmps = 0;
+  int phases = 0;
+  for (size_t i = 0; i < CT_COUNT; i++) {
+    if (last.amps[i] > 0) {
+      sumAmps += last.amps[i];
+      phases++;
     }
   }
+  p["corr"] = round2(phases ? sumAmps / phases : 0);  // 0 = motor parado
 
-  JsonObject amps = payload["current_a"].to<JsonObject>();
+  if (last.vib.valid) p["vib"] = round2(last.vib.vel);
+
+  // Detalhe (fora do schema do Eixo)
+  p["device_id"] = apName;
+  p["ip"] = WiFi.localIP().toString();
+  JsonObject fases = p["corr_fases"].to<JsonObject>();
   for (size_t i = 0; i < CT_COUNT; i++) {
-    amps[currentSensors[i].name] = last.amps[i];
+    fases[currentSensors[i].name] = round2(last.amps[i]);
+  }
+  if (last.vib.valid) {
+    JsonArray axes = p["vib_eixos"].to<JsonArray>();
+    for (float v : last.vib.velAxes) axes.add(round2(v));
   }
 
   serializeJson(doc, body);
@@ -459,6 +529,7 @@ void postReadings() {
     return;
   }
   http.addHeader("Content-Type", "application/json");
+  if (!cfg.apiKey.isEmpty()) http.addHeader("apikey", cfg.apiKey);  // PostgREST do Supabase
 
   int code = http.POST(body);
   postStatus.code = code;
@@ -531,6 +602,9 @@ void handleReadings() {
     vib["rms"] = last.vib.rms;
     vib["peak"] = last.vib.peak;
     vib["std"] = last.vib.stdDev;
+    vib["vel"] = last.vib.vel;
+    JsonArray axes = vib["vel_axes"].to<JsonArray>();
+    for (float v : last.vib.velAxes) axes.add(v);
   }
   sendJson(200, doc);
 }
@@ -540,6 +614,7 @@ void handleGetConfig() {
   doc["name"] = cfg.name;
   doc["post_url"] = cfg.postUrl;
   doc["device_token"] = cfg.token;
+  doc["api_key"] = cfg.apiKey;
   doc["post_interval"] = cfg.postIntervalS;
   doc["batch_size"] = cfg.vibBatch;
   doc["sample_delay"] = cfg.vibDelayMs;
@@ -574,6 +649,10 @@ void handlePostConfig() {
   if (doc["device_token"].is<const char *>()) {
     cfg.token = doc["device_token"].as<String>();
     cfg.token.trim();
+  }
+  if (doc["api_key"].is<const char *>()) {
+    cfg.apiKey = doc["api_key"].as<String>();
+    cfg.apiKey.trim();
   }
   if (doc["post_interval"].is<int>()) cfg.postIntervalS = constrain((int)doc["post_interval"], 2, 3600);
   if (doc["batch_size"].is<int>()) cfg.vibBatch = constrain((int)doc["batch_size"], 10, 2000);
@@ -637,16 +716,21 @@ void setupServer() {
 
 // Campos extras do portal; globais porque o WiFiManager guarda ponteiros para eles
 WiFiManagerParameter paramName("name", "Nome na rede (acesso por http://NOME.local)", "", NAME_MAX_LEN);
-WiFiManagerParameter paramUrl("post_url", "URL de destino (POST)", "", 200,
-                              "placeholder='https://servidor/api/ingest'");
-WiFiManagerParameter paramToken("token", "Token do dispositivo (opcional)", "", 100);
+constexpr int URL_MAX_LEN = 200;
+constexpr int TOKEN_MAX_LEN = 100;
+constexpr int APIKEY_MAX_LEN = 300;  // a chave anon antiga (JWT) passa de 200 caracteres
+WiFiManagerParameter paramUrl("post_url", "URL de destino (POST)", "", URL_MAX_LEN,
+                              "placeholder='https://PROJETO.supabase.co/rest/v1/rpc/ingest'");
+WiFiManagerParameter paramToken("token", "Token do dispositivo (tela do motor no Eixo)", "", TOKEN_MAX_LEN);
+WiFiManagerParameter paramApiKey("api_key", "Chave publicavel do Supabase (apikey)", "", APIKEY_MAX_LEN);
 char portalInfo[400];
 
 // Preenche o portal com a configuracao atual e mostra como achar o coletor depois
 void preparePortal() {
   paramName.setValue(cfg.name.c_str(), NAME_MAX_LEN);
-  paramUrl.setValue(cfg.postUrl.c_str(), 200);
-  paramToken.setValue(cfg.token.c_str(), 100);
+  paramUrl.setValue(cfg.postUrl.c_str(), URL_MAX_LEN);
+  paramToken.setValue(cfg.token.c_str(), TOKEN_MAX_LEN);
+  paramApiKey.setValue(cfg.apiKey.c_str(), APIKEY_MAX_LEN);
 
   String ipLine = WiFi.isConnected() ? "<br>IP atual na rede: <b>" + WiFi.localIP().toString() + "</b>" : "";
   snprintf(portalInfo, sizeof(portalInfo),
@@ -661,16 +745,19 @@ void applyPortalParams() {
   String name = paramName.getValue();
   String url = paramUrl.getValue();
   String token = paramToken.getValue();
+  String apiKey = paramApiKey.getValue();
   token.trim();
+  apiKey.trim();
   if (!normalizeName(name)) name = cfg.name;
   if (!normalizeUrl(url)) {
     Serial.println("URL do portal ignorada: deve comecar com http:// ou https://");
     url = cfg.postUrl;
   }
-  if (name != cfg.name || url != cfg.postUrl || token != cfg.token) {
+  if (name != cfg.name || url != cfg.postUrl || token != cfg.token || apiKey != cfg.apiKey) {
     cfg.name = name;
     cfg.postUrl = url;
     cfg.token = token;
+    cfg.apiKey = apiKey;
     saveConfig();
     Serial.println("Configuracao salva pelo portal");
   }
@@ -695,6 +782,7 @@ void setupWifi() {
   wm.addParameter(&paramName);
   wm.addParameter(&paramUrl);
   wm.addParameter(&paramToken);
+  wm.addParameter(&paramApiKey);
   std::vector<const char *> menu = {"custom", "wifi", "info", "exit"};
   wm.setMenu(menu);
   wm.setConfigPortalTimeout(PORTAL_TIMEOUT_S);
@@ -902,7 +990,8 @@ void loop() {
   }
 
   if (last.vib.valid) {
-    Serial.printf("Vibracao: EMA=%.4f RMS=%.4f Pico=%.4f Std=%.4f\n",
+    Serial.printf("Vibracao: %.2f mm/s (X %.2f Y %.2f Z %.2f) | EMA=%.4f RMS=%.4f Pico=%.4f Std=%.4f\n",
+                  last.vib.vel, last.vib.velAxes[0], last.vib.velAxes[1], last.vib.velAxes[2],
                   last.vib.ema, last.vib.rms, last.vib.peak, last.vib.stdDev);
   } else {
     Serial.println("Vibracao: aguardando ADXL345...");
