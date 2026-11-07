@@ -6,3 +6,6 @@
 case/
 __pycache__/
 *.pyc
+
+# modelo 3D da PCB (22 MB), gerado pelo EasyEDA
+pcb/fabricacao/*.step

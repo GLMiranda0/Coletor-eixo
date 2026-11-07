@@ -33,6 +33,8 @@ Placa **ESP32-WROOM-32 DevKit (30 pinos)** + shield de expansão.
 | LED de status | GPIO2 (LED azul onboard) |
 | Botão BOOT | toque curto abre o portal de configuração; segurar 5 s apaga o Wi-Fi |
 
+Proposta de placa própria (ESP32-WROOM-32E soldado, mesmos GPIOs): [`pcb/`](pcb/README.md).
+
 ## Compilar e gravar
 
 Requer [PlatformIO](https://platformio.org/) (extensão do VS Code ou CLI).
