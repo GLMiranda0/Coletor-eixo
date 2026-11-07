@@ -9,7 +9,7 @@ firmware 1.1.0 roda sem alteração.
 | Pasta | Conteúdo |
 |---|---|
 | `easyeda/Coletor-Eixo.eprj2` | Projeto do EasyEDA Pro 3.2 (esquemático + PCB). Abrir em *File → Open Project* |
-| `fabricacao/` | Gerber (zip), BOM e Pick & Place no formato da JLCPCB, modelo 3D (STEP) |
+| `fabricacao/` | Gerber (zip), BOM e Pick & Place no formato da JLCPCB. O modelo 3D (STEP, 22 MB) não vai para o repositório: exporte pelo EasyEDA em *Export → 3D File* |
 | `scripts/` | Script que gerou o esquemático pela API do EasyEDA ([easyeda-api-skill](https://github.com/easyeda/easyeda-api-skill)) |
 
 ## Placa
