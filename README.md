@@ -20,10 +20,11 @@ função de ingestão, diagnóstico e alertas) fica no repositório complementar
 | `src/main.cpp` | Firmware: leitura dos sensores, Wi-Fi, servidor web local, envio para o `ingest` do Eixo |
 | `src/webui.h` | Interface web servida pelo próprio coletor (`http://coletor.local`) |
 | `platformio.ini` | Projeto PlatformIO (placa, partições, bibliotecas) |
+| `pcb/` | **Proposta** de placa própria (esquemático, PCB, desenho técnico); não será fabricada |
 
 ## Hardware
 
-Placa **ESP32-WROOM-32 DevKit (30 pinos)** + shield de expansão.
+Protótipo em uso: placa **ESP32-WROOM-32 DevKit (30 pinos)** + shield de expansão.
 
 | Sensor | Ligação |
 |---|---|
@@ -33,7 +34,9 @@ Placa **ESP32-WROOM-32 DevKit (30 pinos)** + shield de expansão.
 | LED de status | GPIO2 (LED azul onboard) |
 | Botão BOOT | toque curto abre o portal de configuração; segurar 5 s apaga o Wi-Fi |
 
-Proposta de placa própria (ESP32-WROOM-32E soldado, mesmos GPIOs): [`pcb/`](pcb/README.md).
+**Próximo passo proposto (não será fabricado):** placa própria com ESP32-WROOM-32E soldado, os mesmos GPIOs
+dos sensores e alimentação por USB-C ou bateria Li-ion com carga pela USB, com desenho técnico para a caixa —
+ver [`pcb/`](pcb/README.md). O projeto continua com o protótipo acima.
 
 ## Compilar e gravar
 
