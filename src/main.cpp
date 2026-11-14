@@ -16,7 +16,7 @@
 #include "webui.h"
 
 // Vai em cada leitura enviada (extras.fw no Eixo)
-constexpr const char *FW_VERSION = "1.1.0";
+constexpr const char *FW_VERSION = "1.1.1";
 
 // LED azul onboard da placa (marcado "D2")
 constexpr uint8_t LED_PIN = 2;
@@ -425,7 +425,7 @@ void computeVelocity(int n, float dt, Vibration &vib) {
 }
 
 // Coleta uma janela de amostras e extrai EMA, RMS, pico e desvio padrao da magnitude normalizada.
-// Atende a interface web entre as amostras.
+// Atende a interface web entre as amostras, entao nao passe last.vib direto: meca numa copia.
 void measureVibration(Vibration &vib) {
   vib.valid = false;
   if (!accelOk) {
@@ -1088,7 +1088,11 @@ void loop() {
   sensors.requestTemperatures();
 
   measureCurrents(last.amps);
-  measureVibration(last.vib);
+  // Mede numa copia: a janela leva ~1 s atendendo a interface web, e medir direto em last.vib
+  // deixaria /api/readings sem vibracao (valid = false) durante a coleta.
+  Vibration vib = {};
+  measureVibration(vib);
+  last.vib = vib;
 
   while (count > 0 && !sensors.isConversionComplete()) {
     serviceTasks();
